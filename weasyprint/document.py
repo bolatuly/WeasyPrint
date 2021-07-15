@@ -33,7 +33,7 @@ from .logger import LOGGER, PROGRESS_LOGGER
 from .text.ffi import ffi, pango
 from .text.fonts import FontConfiguration
 from .urls import URLFetchingError
-
+from .wkt import get_wkt_from_epsg
 
 def _w3c_date_to_pdf(string, attr_name):
     """Tranform W3C date to PDF format."""
@@ -508,6 +508,12 @@ def rectangle_aabb(matrix, pos_x, pos_y, width, height):
     box_y2 = max(y1, y2, y3, y4)
     return box_x1, box_y1, box_x2, box_y2
 
+def resolve_geocodings(pages):
+    for page in pages:
+        page_geocodings = []
+        for geocoding in page.geocodings:
+            page_geocodings.append(geocoding)
+        yield page_geocodings
 
 def resolve_links(pages):
     """Resolve internal hyperlinks.
@@ -627,6 +633,9 @@ class Page:
         #: ``(x, y)`` point in CSS pixels from the top-left of the page.
         self.anchors = {}
 
+        #geocodings
+        self.geocodings = []
+
         self._gather_links_and_bookmarks(page_box)
         self._page_box = page_box
 
@@ -686,7 +695,7 @@ class Page:
         # In case of duplicate IDs, only the first is an anchor.
         has_anchor = anchor_name and anchor_name not in self.anchors
 
-        if has_bookmark or has_link or has_anchor:
+        if has_bookmark or has_link or has_anchor or box.is_for_geocoding_bbox:
             pos_x, pos_y, width, height = box.hit_area()
             if has_link:
                 token_type, link = link
@@ -713,6 +722,13 @@ class Page:
                     (bookmark_level, bookmark_label, (pos_x, pos_y), state))
             if has_anchor:
                 self.anchors[anchor_name] = pos_x, pos_y
+            if box.is_for_geocoding_bbox:
+                pos_x, pos_y, width, height = box.svg_content_area()
+                if matrix:
+                    geocoding = (rectangle_aabb(matrix, pos_x, pos_y, width, height), box.bounding_box, box.epsg)
+                else:
+                    geocoding = ((pos_x, pos_y, width, height), box.bounding_box, box.epsg)
+                self.geocodings.append(geocoding)
 
         for child in box.all_children():
             self._gather_links_and_bookmarks(child, matrix)
@@ -1012,6 +1028,9 @@ class Document:
             [link for link in page_links if link[0] == 'attachment']
             for page_links, page_anchors in page_links_and_anchors]
 
+         # gather geocodings by page
+        paged_geocodings = list(resolve_geocodings(self.pages))
+
         # Annotations
         annot_files = {}
         # A single link can be split in multiple regions. We don't want to
@@ -1037,8 +1056,8 @@ class Document:
         last_by_depth = [root]
         previous_level = 0
 
-        for page_number, (page, links_and_anchors, page_links) in enumerate(
-                zip(self.pages, page_links_and_anchors, attachment_links)):
+        for page_number, (page, links_and_anchors, page_links, page_geocoding) in enumerate(
+                zip(self.pages, page_links_and_anchors, attachment_links, paged_geocodings)):
             # Draw from the top-left corner
             matrix = Matrix(scale, 0, 0, -scale, 0, page.height * scale)
 
@@ -1153,6 +1172,35 @@ class Document:
                 del last_by_depth[depth:]
                 last_by_depth.append(children)
 
+            # geocodings
+            for geocoding in page_geocoding:
+                rec, bounding_box, epsg = geocoding
+                size = (rec[0] + rec[2], rec[1] + rec[3])
+                rec = (
+                        *matrix.transform_point(*rec[:2]),
+                        *matrix.transform_point(*size))
+                bbox = pydyf.Dictionary({
+                    'BBox': pydyf.Array(rec),
+                    'Measure': pydyf.Dictionary({
+                        'Bounds': '[ 0 1 0 0 1 0 1 1 ]',
+                        'GCS': pydyf.Dictionary({
+                            'EPSG': epsg,
+                            'Type': '/GEOGCS',
+                            'WKT': '({wkt})'.format(wkt = get_wkt_from_epsg(epsg)),
+                        }),
+                        'GPTS': '[ {0:f} {1:f} {0:f} {3:f} {2:f} {3:f} {2:f} {1:f} ]'.format(*bounding_box),
+                        'LPTS': '[ 0 1 0 0 1 0 1 1 ]',
+                        'Subtype': '/GEO',
+                        'Type': '/Measure'
+                    }),
+                    'Name': '(Layer)',
+                    'Type': '/Viewport',
+                })
+                pdf.add_object(bbox)
+                if 'Annots' not in pdf_page:
+                    pdf_page['VP'] = pydyf.Array()
+                pdf_page['VP'].append(bbox.reference)
+            
         # Outlines
         outlines, count = create_bookmarks(root, pdf)
         if outlines:

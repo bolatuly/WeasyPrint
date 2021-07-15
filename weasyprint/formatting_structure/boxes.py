@@ -84,6 +84,11 @@ class Box:
     string_set = None
     download_name = None
 
+    #geocoding box
+    is_for_geocoding_bbox = False
+    bounding_box = None
+    epsg = None
+
     # Default, overriden on some subclasses
     def all_children(self):
         return ()
@@ -196,6 +201,10 @@ class Box:
         # TODO: manage the border radii, use outer_border_radii instead
         return (self.border_box_x(), self.border_box_y(),
                 self.border_width(), self.border_height())
+    
+    def svg_content_area(self):
+        return (self.position_x + self.margin_left + self.border_left_width,
+            self.position_y + self.margin_top + self.border_top_width, self.width, self.height)
 
     def rounded_box(self, bt, br, bb, bl):
         """Position, size and radii of a box inside the outer border box.
